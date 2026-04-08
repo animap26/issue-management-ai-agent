@@ -8,9 +8,13 @@ Each tool has:
 
 from __future__ import annotations
 
+import base64
 import json
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+import anthropic
 
 import data_store
 from config import (
@@ -22,6 +26,66 @@ from config import (
     Status,
 )
 from models import AuditEntry, Issue
+
+# ---------------------------------------------------------------------------
+# GRC PDF extraction prompt
+# ---------------------------------------------------------------------------
+
+EXTRACTION_PROMPT = """\
+Extract every IT risk issue, control deficiency, and finding from this GRC tool export PDF.
+
+Map each item to the following JSON structure (omit any field that has no value):
+{
+  "title": "short issue title",
+  "description": "full description or details",
+  "issue_type": one of ["Control Deficiency","Self-Identified Issue","Audit Finding",
+                        "Regulatory Finding","Incident-Derived Issue","Vulnerability","Process Gap"],
+  "control_domain": one of ["Access Management","Change Management","IT Operations",
+                             "Information Security","Data Management","Vendor Management",
+                             "Business Continuity & DR","Software Development",
+                             "Infrastructure & Networks","Incident Management"],
+  "severity": one of ["Critical","High","Medium","Low"],
+  "status": one of ["Open","In Remediation","Pending Validation","Closed",
+                    "Escalated","Overdue","Accepted Risk"],
+  "owner": "assigned owner or team name",
+  "business_unit": "business unit or department",
+  "control_id": "internal control reference (e.g. IT-AC-001, CTRL-123)",
+  "is_sox_relevant": true or false,
+  "regulatory_impact": "SOX, PCI-DSS, GDPR, etc.",
+  "root_cause": "root cause analysis text",
+  "remediation_plan": "corrective action plan",
+  "due_date": "YYYY-MM-DD",
+  "source_id": "original GRC tool ID (e.g. INC0001234, RISK-456, SN-789)"
+}
+
+Severity mapping:
+  ServiceNow Priority: P1 → Critical | P2 → High | P3 → Medium | P4 → Low
+  Archer / generic:    Critical/Very High → Critical | High → High | Medium → Medium | Low → Low
+
+Status mapping:
+  Open / New / Draft                    → "Open"
+  In Progress / Assigned / Work in Progress → "In Remediation"
+  Resolved / Pending Review             → "Pending Validation"
+  Closed / Complete                     → "Closed"
+  Escalated                             → "Escalated"
+  Overdue / Past Due                    → "Overdue"
+  Accepted / Risk Accepted              → "Accepted Risk"
+
+Control Domain guidance:
+  User access, provisioning, privileged access, access reviews → "Access Management"
+  Change requests, unauthorised changes, SDLC change control   → "Change Management"
+  Backups, monitoring, job scheduling, availability            → "IT Operations"
+  Vulnerabilities, patches, encryption, firewall, DLP         → "Information Security"
+  Data integrity, retention, classification                    → "Data Management"
+  Third-party risk, vendor assessments                         → "Vendor Management"
+  BCP, DR, RTO/RPO                                             → "Business Continuity & DR"
+  SDLC, code review, testing                                   → "Software Development"
+  Network, servers, cloud infrastructure                       → "Infrastructure & Networks"
+  Incident response, security events                           → "Incident Management"
+
+Return ONLY a valid JSON array of issue objects.
+If no issues are found, return an empty array [].
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +340,45 @@ TOOL_SCHEMAS: list[dict] = [
                 },
             },
             "required": ["issue_id", "remediation_evidence"],
+        },
+    },
+    {
+        "name": "read_pdf_from_grc",
+        "description": (
+            "Read a PDF exported from a GRC tool (ServiceNow, Archer, MetricStream, etc.) "
+            "and extract all IT issues into structured data. "
+            "Returns a JSON payload with the issues found — review them before importing. "
+            "Call import_extracted_issues afterwards to create them in the register."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Absolute or relative path to the PDF file on disk.",
+                },
+            },
+            "required": ["file_path"],
+        },
+    },
+    {
+        "name": "import_extracted_issues",
+        "description": (
+            "Bulk-create issues from a list of issue objects previously extracted from a GRC PDF. "
+            "Preserves the GRC source ID in each issue's notes. "
+            "Respects the status from the GRC tool (e.g. In Remediation, Pending Validation). "
+            "Always show the user a preview from read_pdf_from_grc and confirm before calling this."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "issues": {
+                    "type": "array",
+                    "description": "Array of issue objects from read_pdf_from_grc.",
+                    "items": {"type": "object"},
+                },
+            },
+            "required": ["issues"],
         },
     },
 ]
@@ -540,6 +643,154 @@ def close_issue(issue_id: str, remediation_evidence: str) -> str:
     )
 
 
+def read_pdf_from_grc(file_path: str) -> str:
+    """
+    Read a GRC-tool PDF export and use Claude to extract structured issue data.
+    Returns a JSON string ready for review before calling import_extracted_issues.
+    """
+    path = Path(file_path).expanduser().resolve()
+    if not path.exists():
+        return f"File not found: {file_path}"
+    if path.suffix.lower() != ".pdf":
+        return f"File is not a PDF: {file_path}"
+
+    with path.open("rb") as f:
+        pdf_b64 = base64.standard_b64encode(f.read()).decode()
+
+    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+
+    print(f"  [pdf] Extracting issues from '{path.name}' via Claude…")
+    extraction = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=8192,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_b64,
+                        },
+                    },
+                    {"type": "text", "text": EXTRACTION_PROMPT},
+                ],
+            }
+        ],
+    )
+
+    raw = next((b.text for b in extraction.content if b.type == "text"), "[]").strip()
+
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:])
+        if raw.endswith("```"):
+            raw = raw[: raw.rfind("```")]
+
+    try:
+        extracted: list[dict] = json.loads(raw)
+    except json.JSONDecodeError:
+        return f"Could not parse extracted issues. Raw output:\n{raw[:800]}"
+
+    return json.dumps(
+        {
+            "source_file": path.name,
+            "issues_found": len(extracted),
+            "issues": extracted,
+        },
+        indent=2,
+    )
+
+
+def import_extracted_issues(issues: list[dict]) -> str:
+    """
+    Bulk-create issues extracted from a GRC PDF.
+    Preserves GRC source ID in notes and honours GRC status/due-date.
+    """
+    ALLOWED_FIELDS = {
+        "title", "description", "issue_type", "control_domain", "severity",
+        "owner", "business_unit", "control_id", "is_sox_relevant",
+        "regulatory_impact", "root_cause", "remediation_plan",
+    }
+
+    created_lines: list[str] = []
+    skipped_lines: list[str] = []
+
+    for idx, raw in enumerate(issues, 1):
+        # Pull out fields that create_issue doesn't accept
+        source_id = raw.get("source_id")
+        status_from_grc = raw.get("status")
+        due_date_from_grc = raw.get("due_date")
+
+        create_kwargs = {k: v for k, v in raw.items() if k in ALLOWED_FIELDS and v is not None}
+
+        required = ["title", "description", "issue_type", "control_domain", "severity"]
+        missing = [f for f in required if not create_kwargs.get(f)]
+        if missing:
+            label = raw.get("title", f"Issue {idx}")[:50]
+            skipped_lines.append(f"  - '{label}': missing {missing}")
+            continue
+
+        try:
+            result = create_issue(**create_kwargs)
+
+            # Parse the auto-assigned ID from the result string
+            issue_id: str | None = None
+            for line in result.split("\n"):
+                if "ID:" in line:
+                    issue_id = line.split("ID:")[1].strip()
+                    break
+
+            if issue_id is None:
+                skipped_lines.append(f"  - Issue {idx}: could not determine assigned ID")
+                continue
+
+            # Apply GRC status and due-date overrides
+            post_updates: dict[str, Any] = {}
+            if status_from_grc and status_from_grc != "Open":
+                try:
+                    post_updates["status"] = Status(status_from_grc).value
+                except ValueError:
+                    pass  # unknown status — leave as Open
+            if due_date_from_grc:
+                post_updates["due_date"] = due_date_from_grc
+            if post_updates:
+                data_store.update_issue(issue_id, post_updates)
+
+            # Record GRC provenance in the issue notes and audit trail
+            if source_id:
+                issue = data_store.get_issue(issue_id)
+                if issue:
+                    stamped = (
+                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] "
+                        f"Imported from GRC tool. Source ID: {source_id}"
+                    )
+                    issue.notes.append(stamped)
+                    issue.audit_trail.append(
+                        AuditEntry(action="grc_import", new_value=f"Source: {source_id}")
+                    )
+                    data_store.save_issue(issue)
+
+            created_lines.append(
+                f"  {issue_id} ← {source_id or 'no source ID'}: "
+                f"{create_kwargs['title'][:65]}"
+            )
+        except Exception as exc:
+            label = create_kwargs.get("title", f"Issue {idx}")[:50]
+            skipped_lines.append(f"  - '{label}': {exc}")
+
+    lines = [f"Import complete: {len(created_lines)} created, {len(skipped_lines)} skipped.\n"]
+    if created_lines:
+        lines.append("Created:")
+        lines.extend(created_lines)
+    if skipped_lines:
+        lines.append("\nSkipped:")
+        lines.extend(skipped_lines)
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher — routes tool name → implementation
 # ---------------------------------------------------------------------------
@@ -562,6 +813,10 @@ def dispatch(tool_name: str, tool_input: dict) -> str:
             return generate_report(**tool_input)
         elif tool_name == "close_issue":
             return close_issue(**tool_input)
+        elif tool_name == "read_pdf_from_grc":
+            return read_pdf_from_grc(**tool_input)
+        elif tool_name == "import_extracted_issues":
+            return import_extracted_issues(**tool_input)
         else:
             return f"Unknown tool: {tool_name}"
     except Exception as exc:

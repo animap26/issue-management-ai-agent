@@ -3,7 +3,8 @@ IT Control Deficiency & Self-Identified Issue (SII) Management Agent
 First Line of Risk — AI-assisted issue tracking and remediation
 
 Usage:
-    python agent.py
+    python agent.py                          # interactive mode
+    python agent.py --pdf /path/to/export.pdf  # load a GRC PDF at startup
 
 Requires:
     ANTHROPIC_API_KEY environment variable set.
@@ -11,8 +12,11 @@ Requires:
 
 from __future__ import annotations
 
+import argparse
+import base64
 import os
 import sys
+from pathlib import Path
 
 import anthropic
 
@@ -64,6 +68,20 @@ a risk/compliance audience.
 - check_overdue_issues — scan and flag overdue items
 - generate_report — management reports (summary, SOX, overdue, by domain, full)
 - close_issue — close a remediated issue with evidence
+- read_pdf_from_grc — extract issues from a GRC tool PDF export (ServiceNow, Archer, etc.)
+- import_extracted_issues — bulk-create issues extracted from a GRC PDF
+
+## GRC PDF Import Workflow
+When asked to import a PDF:
+1. Call read_pdf_from_grc with the file path.
+2. Present the extracted issues to the user — title, severity, domain, source ID — as a \
+numbered preview table.
+3. Flag any Critical or SOX-relevant items explicitly and confirm with the user before proceeding.
+4. On confirmation, call import_extracted_issues with the issues array.
+5. Report the import summary (created / skipped) and immediately run check_overdue_issues.
+
+If the PDF is provided directly in the conversation (not as a file path), you can read and \
+analyse it in-context before calling import_extracted_issues.
 
 Begin each session by offering to run a quick status check (overdue scan + summary report) \
 unless the user immediately starts with a specific request."""
@@ -134,7 +152,46 @@ def _summarise_input(input_dict: dict) -> str:
     return ", ".join(pairs) + suffix
 
 
+def _build_pdf_message(pdf_path: Path, prompt: str) -> dict:
+    """
+    Construct a user message that embeds a PDF as a document block
+    so Claude can read it natively alongside the text prompt.
+    """
+    with pdf_path.open("rb") as f:
+        pdf_b64 = base64.standard_b64encode(f.read()).decode()
+
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": pdf_b64,
+                },
+                "title": pdf_path.name,
+            },
+            {"type": "text", "text": prompt},
+        ],
+    }
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="IT Issue Management Agent — First Line of Risk"
+    )
+    parser.add_argument(
+        "--pdf",
+        metavar="FILE",
+        help="Path to a GRC tool PDF export to import at startup.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
+
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("Error: ANTHROPIC_API_KEY environment variable is not set.")
@@ -148,12 +205,35 @@ def main() -> None:
     print("=" * 60)
     print("Type your message below. Commands: 'quit' to exit.\n")
 
-    # Kick off with a status check on first run
-    opening_prompt = (
-        "Run a quick status check: scan for overdue issues and give me a summary report."
-    )
-    print(f"Agent initialising — running status check...\n")
-    messages.append({"role": "user", "content": opening_prompt})
+    if args.pdf:
+        # PDF import mode — embed the PDF in the opening message
+        pdf_path = Path(args.pdf).expanduser().resolve()
+        if not pdf_path.exists():
+            print(f"Error: PDF not found: {pdf_path}")
+            sys.exit(1)
+        if pdf_path.suffix.lower() != ".pdf":
+            print(f"Error: File is not a PDF: {pdf_path}")
+            sys.exit(1)
+
+        print(f"Loading GRC export: {pdf_path.name}\n")
+        opening_msg = _build_pdf_message(
+            pdf_path,
+            (
+                "This is an IT issue export from our GRC tool. "
+                "Please extract all issues from this document, present me a preview table "
+                "(ID, title, severity, domain, GRC source ID), highlight any Critical or "
+                "SOX-relevant items, then ask for my confirmation before importing."
+            ),
+        )
+    else:
+        # Standard mode — status check on startup
+        print("Agent initialising — running status check...\n")
+        opening_msg = {
+            "role": "user",
+            "content": "Run a quick status check: scan for overdue issues and give me a summary report.",
+        }
+
+    messages.append(opening_msg)
     response = run_agent_turn(client, messages)
     print(f"\nAgent: {response}\n")
 
