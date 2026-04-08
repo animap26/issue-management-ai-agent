@@ -18,6 +18,7 @@ import anthropic
 
 import data_store
 from config import (
+    DOMAIN_TO_TEAM,
     FRAMEWORK_REFERENCES,
     SLA_DAYS,
     ControlDomain,
@@ -25,7 +26,7 @@ from config import (
     Severity,
     Status,
 )
-from models import AuditEntry, Issue
+from models import ActionItem, AuditEntry, Checkpoint, ControlImpact, Issue
 
 # ---------------------------------------------------------------------------
 # GRC PDF extraction prompt
@@ -85,6 +86,67 @@ Control Domain guidance:
 
 Return ONLY a valid JSON array of issue objects.
 If no issues are found, return an empty array [].
+"""
+
+
+# ---------------------------------------------------------------------------
+# Issue analysis prompt
+# ---------------------------------------------------------------------------
+
+ANALYSIS_PROMPT_TEMPLATE = """\
+You are a senior IT risk analyst helping a first-line risk team analyse a control deficiency \
+or self-identified issue. Produce a comprehensive structured analysis of the issue below.
+
+=== ISSUE DETAILS ===
+{issue_details}
+
+=== FIRST-LINE TEAMS AVAILABLE ===
+- Infrastructure Services (owns: Infrastructure & Networks, IT Operations, Incident Management)
+- Application Development (owns: Software Development, Change Management)
+- Service Continuity & Disaster Recovery (owns: Business Continuity & DR)
+- Information Security (owns: Information Security, Access Management, Data Management)
+- Third Party Risk Management (owns: Vendor Management)
+
+=== REQUIRED OUTPUT ===
+Return a single valid JSON object with exactly these three keys:
+
+{{
+  "problem_statement": "<3–5 sentence statement covering: what the issue is, \
+why it is a risk, which processes/systems are affected, and the consequence if \
+not remediated>",
+
+  "control_impacts": [
+    {{
+      "control_name": "<name of the specific IT control that is impacted>",
+      "control_id": "<internal control ID if known, else null>",
+      "gap_description": "<exactly what is broken or missing in this control>",
+      "risk_rating": "<Critical|High|Medium|Low>",
+      "framework_refs": {{
+        "SOX_ITGC": "<relevant ITGC category or null>",
+        "COBIT": "<relevant COBIT process or null>",
+        "ISO_27001": "<relevant clause or null>",
+        "NIST_CSF": "<relevant function/category or null>"
+      }}
+    }}
+  ],
+
+  "action_items": [
+    {{
+      "task": "<specific, actionable remediation step>",
+      "team": "<one of the first-line teams above>",
+      "priority": "<Critical|High|Medium|Low>",
+      "estimated_days": <integer number of days from today>,
+      "dependencies": [<list of task descriptions this step depends on, or empty list>],
+      "notes": "<any important caveats or guidance for this step, or null>"
+    }}
+  ]
+}}
+
+Rules:
+- problem_statement must be a plain string, not an object.
+- List action items in dependency order (prerequisites first).
+- Be specific — name the systems, processes, teams, and controls involved.
+- Return ONLY the JSON object. No markdown, no explanatory text.
 """
 
 
@@ -381,6 +443,137 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["issues"],
         },
     },
+    {
+        "name": "analyse_issue",
+        "description": (
+            "Generate a structured analysis for an issue: a problem statement, "
+            "a list of impacted IT controls with framework references, and a "
+            "recommended action plan with first-line team assignments and timelines. "
+            "This is the primary work product the risk analyst shares with first-line "
+            "teams at the first checkpoint review. "
+            "Stores the analysis on the issue record."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "issue_id": {
+                    "type": "string",
+                    "description": "ID of the issue to analyse (e.g. IIT-0001).",
+                },
+            },
+            "required": ["issue_id"],
+        },
+    },
+    {
+        "name": "get_issue_analysis",
+        "description": (
+            "Retrieve the full analysis for an issue: problem statement, control impacts, "
+            "action plan, and checkpoint history. Use this to prepare for a review meeting "
+            "or to check current progress."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "issue_id": {
+                    "type": "string",
+                    "description": "ID of the issue.",
+                },
+            },
+            "required": ["issue_id"],
+        },
+    },
+    {
+        "name": "update_action_item",
+        "description": (
+            "Update the status or details of a specific action item within an issue. "
+            "Use this after a checkpoint review to reflect what was agreed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "issue_id": {
+                    "type": "string",
+                    "description": "The issue ID.",
+                },
+                "action_item_id": {
+                    "type": "string",
+                    "description": "The action item ID (e.g. AI-001).",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["Pending", "In Progress", "Completed", "Blocked"],
+                    "description": "New status of the action item.",
+                },
+                "owner": {
+                    "type": "string",
+                    "description": "Named owner assigned to this action item.",
+                },
+                "target_date": {
+                    "type": "string",
+                    "description": "Revised target date in YYYY-MM-DD format.",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Progress notes or blockers.",
+                },
+            },
+            "required": ["issue_id", "action_item_id"],
+        },
+    },
+    {
+        "name": "log_checkpoint",
+        "description": (
+            "Record the outcome of a checkpoint review meeting between the risk analyst "
+            "and the first-line team. Captures attendees, discussion summary, decisions "
+            "made, agreed actions, and the next checkpoint date. "
+            "Every checkpoint is permanently recorded in the issue audit trail."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "issue_id": {
+                    "type": "string",
+                    "description": "The issue ID.",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Date of the review meeting in YYYY-MM-DD format.",
+                },
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Names of attendees (risk analyst and first-line team members).",
+                },
+                "agenda": {
+                    "type": "string",
+                    "description": "Topics covered in the review meeting.",
+                },
+                "discussion_summary": {
+                    "type": "string",
+                    "description": "Summary of the discussion and findings.",
+                },
+                "decisions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Formal decisions made during the meeting.",
+                },
+                "agreed_actions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Specific actions agreed, with owner and target date where known.",
+                },
+                "next_steps": {
+                    "type": "string",
+                    "description": "Summary of what happens between now and the next checkpoint.",
+                },
+                "next_checkpoint_date": {
+                    "type": "string",
+                    "description": "Date of the next scheduled review in YYYY-MM-DD format.",
+                },
+            },
+            "required": ["issue_id", "date", "attendees", "discussion_summary"],
+        },
+    },
 ]
 
 
@@ -643,6 +836,313 @@ def close_issue(issue_id: str, remediation_evidence: str) -> str:
     )
 
 
+def analyse_issue(issue_id: str) -> str:
+    """
+    Generate a problem statement, control impact analysis, and action plan
+    for the given issue using Claude, then store the analysis on the record.
+    """
+    issue = data_store.get_issue(issue_id)
+    if issue is None:
+        return f"Issue '{issue_id}' not found."
+
+    # Build a rich issue description for the analysis prompt
+    framework_text = "\n".join(f"  {k}: {v}" for k, v in issue.framework_references.items())
+    issue_details = (
+        f"ID: {issue.id}\n"
+        f"Title: {issue.title}\n"
+        f"Type: {issue.issue_type}\n"
+        f"Control Domain: {issue.control_domain}\n"
+        f"Severity: {issue.severity}  (Critical=Material Weakness, High=Significant Deficiency, "
+        f"Medium=Deficiency, Low=Observation)\n"
+        f"SOX Relevant: {issue.is_sox_relevant}\n"
+        f"Regulatory Impact: {issue.regulatory_impact or 'None stated'}\n"
+        f"Description:\n{issue.description}\n"
+        f"Root Cause: {issue.root_cause or 'Not yet determined'}\n"
+        f"Existing Remediation Notes: {issue.remediation_plan or 'None'}\n"
+        f"Framework References:\n{framework_text or '  None mapped'}\n"
+        f"Business Unit / Owner: {issue.business_unit or 'Not specified'} / "
+        f"{issue.owner or 'Not assigned'}\n"
+    )
+
+    prompt = ANALYSIS_PROMPT_TEMPLATE.format(issue_details=issue_details)
+
+    print(f"  [analyse] Generating analysis for {issue_id} via Claude…")
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=4096,
+        thinking={"type": "adaptive"},
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = next((b.text for b in response.content if b.type == "text"), "{}").strip()
+    # Strip markdown fences if present
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:])
+        if raw.endswith("```"):
+            raw = raw[: raw.rfind("```")]
+
+    try:
+        analysis: dict = json.loads(raw)
+    except json.JSONDecodeError:
+        return f"Could not parse analysis JSON. Raw output:\n{raw[:600]}"
+
+    # Store problem statement
+    issue.problem_statement = analysis.get("problem_statement", "")
+
+    # Store control impacts
+    issue.control_impacts = [
+        ControlImpact(
+            control_id=ci.get("control_id"),
+            control_name=ci.get("control_name", ""),
+            gap_description=ci.get("gap_description", ""),
+            risk_rating=ci.get("risk_rating", "Medium"),
+            framework_refs=ci.get("framework_refs", {}),
+        )
+        for ci in analysis.get("control_impacts", [])
+    ]
+
+    # Store action items (sequential IDs)
+    new_items: list[ActionItem] = []
+    for ai_data in analysis.get("action_items", []):
+        item_id = f"AI-{len(new_items) + 1:03d}"
+        est_days = ai_data.get("estimated_days")
+        target = (
+            (date.today() + timedelta(days=est_days)).isoformat() if est_days else None
+        )
+        # If no explicit team, infer from control domain
+        team = ai_data.get("team") or DOMAIN_TO_TEAM.get(issue.control_domain, "")
+        new_items.append(
+            ActionItem(
+                id=item_id,
+                task=ai_data.get("task", ""),
+                team=team,
+                priority=ai_data.get("priority", "Medium"),
+                estimated_days=est_days,
+                target_date=target,
+                dependencies=ai_data.get("dependencies", []),
+                notes=ai_data.get("notes"),
+            )
+        )
+    issue.action_items = new_items
+
+    # Mark analysis as generated
+    issue.analysis_generated = True
+    issue.analysis_generated_date = datetime.now().isoformat()
+    issue.audit_trail.append(
+        AuditEntry(action="analysis_generated", new_value=f"{len(new_items)} action items")
+    )
+    issue.updated_date = datetime.now().isoformat()
+    data_store.save_issue(issue)
+
+    # Format output for the risk analyst to review
+    lines = [
+        f"=== Analysis for {issue_id}: {issue.title} ===\n",
+        "PROBLEM STATEMENT",
+        "-" * 40,
+        issue.problem_statement or "(none)",
+        "",
+        "CONTROL IMPACTS",
+        "-" * 40,
+    ]
+    for ci in issue.control_impacts:
+        lines += [
+            f"  ▸ {ci.control_name}  [{ci.risk_rating}]",
+            f"    Gap: {ci.gap_description}",
+            "    Framework refs: " + ", ".join(f"{k}: {v}" for k, v in ci.framework_refs.items() if v),
+            "",
+        ]
+
+    lines += ["ACTION PLAN", "-" * 40]
+    for ai in issue.action_items:
+        dep_text = f"  (after: {', '.join(ai.dependencies)})" if ai.dependencies else ""
+        lines += [
+            f"  {ai.id}  [{ai.priority}]  Team: {ai.team or 'TBD'}",
+            f"    {ai.task}",
+            f"    Target: {ai.target_date or 'TBD'}  |  Est. {ai.estimated_days or '?'}d{dep_text}",
+        ]
+        if ai.notes:
+            lines.append(f"    Note: {ai.notes}")
+        lines.append("")
+
+    lines.append(
+        f"Analysis stored on {issue_id}. Share with the first-line team and log the "
+        f"review outcome as a checkpoint using log_checkpoint."
+    )
+    return "\n".join(lines)
+
+
+def get_issue_analysis(issue_id: str) -> str:
+    """Return the full analysis, action plan status, and checkpoint history."""
+    issue = data_store.get_issue(issue_id)
+    if issue is None:
+        return f"Issue '{issue_id}' not found."
+    if not issue.analysis_generated:
+        return (
+            f"No analysis has been generated for {issue_id} yet. "
+            f"Call analyse_issue('{issue_id}') to generate one."
+        )
+
+    lines = [
+        f"=== {issue_id}: {issue.title} ===",
+        f"Severity: {issue.severity}  |  Status: {issue.status}  |  "
+        f"SOX: {'Yes' if issue.is_sox_relevant else 'No'}  |  "
+        f"Due: {issue.due_date or 'N/A'}",
+        f"First-line team: {issue.first_line_team or 'Not assigned'}",
+        "",
+        "PROBLEM STATEMENT",
+        "-" * 40,
+        issue.problem_statement or "(not generated)",
+        "",
+        "CONTROL IMPACTS",
+        "-" * 40,
+    ]
+    for ci in issue.control_impacts:
+        lines += [
+            f"  ▸ {ci.control_name}  [{ci.risk_rating}]",
+            f"    {ci.gap_description}",
+        ]
+        refs = ", ".join(f"{k}: {v}" for k, v in ci.framework_refs.items() if v)
+        if refs:
+            lines.append(f"    {refs}")
+        lines.append("")
+
+    lines += ["ACTION PLAN", "-" * 40]
+    for ai in issue.action_items:
+        status_icon = {"Completed": "✓", "In Progress": "►", "Blocked": "✗"}.get(ai.status, "○")
+        lines += [
+            f"  {status_icon} {ai.id}  [{ai.priority}]  {ai.status}  —  Team: {ai.team or 'TBD'}",
+            f"    {ai.task}",
+            f"    Target: {ai.target_date or 'TBD'}",
+        ]
+        if ai.notes:
+            lines.append(f"    Note: {ai.notes}")
+        lines.append("")
+
+    open_actions = sum(1 for a in issue.action_items if a.status != "Completed")
+    lines.append(
+        f"Action items: {len(issue.action_items)} total, {open_actions} open."
+    )
+
+    if issue.checkpoints:
+        lines += ["", "CHECKPOINT HISTORY", "-" * 40]
+        for cp in issue.checkpoints:
+            lines += [
+                f"  [{cp.id}] {cp.date}  |  Attendees: {', '.join(cp.attendees)}",
+                f"    {cp.discussion_summary or '(no summary)'}",
+            ]
+            if cp.decisions:
+                lines.append("    Decisions: " + "; ".join(cp.decisions))
+            if cp.next_checkpoint_date:
+                lines.append(f"    Next checkpoint: {cp.next_checkpoint_date}")
+            lines.append("")
+    else:
+        lines += ["", "No checkpoints recorded yet."]
+
+    return "\n".join(lines)
+
+
+def update_action_item(
+    issue_id: str,
+    action_item_id: str,
+    status: str | None = None,
+    owner: str | None = None,
+    target_date: str | None = None,
+    notes: str | None = None,
+) -> str:
+    issue = data_store.get_issue(issue_id)
+    if issue is None:
+        return f"Issue '{issue_id}' not found."
+
+    ai = next((a for a in issue.action_items if a.id == action_item_id), None)
+    if ai is None:
+        return f"Action item '{action_item_id}' not found on {issue_id}."
+
+    changes: list[str] = []
+    if status:
+        ai.status = status
+        if status == "Completed":
+            ai.completed_date = datetime.now().isoformat()
+        changes.append(f"status={status}")
+    if owner:
+        ai.owner = owner
+        changes.append(f"owner={owner}")
+    if target_date:
+        ai.target_date = target_date
+        changes.append(f"target_date={target_date}")
+    if notes:
+        ai.notes = (ai.notes + "\n" + notes) if ai.notes else notes
+        changes.append("notes updated")
+
+    issue.updated_date = datetime.now().isoformat()
+    issue.audit_trail.append(
+        AuditEntry(
+            action="action_item_updated",
+            field=action_item_id,
+            new_value=", ".join(changes),
+        )
+    )
+    data_store.save_issue(issue)
+
+    open_count = sum(1 for a in issue.action_items if a.status != "Completed")
+    return (
+        f"Action item {action_item_id} updated on {issue_id}.\n"
+        f"  Changes: {', '.join(changes)}\n"
+        f"  Open actions remaining: {open_count}"
+    )
+
+
+def log_checkpoint(
+    issue_id: str,
+    date: str,
+    attendees: list[str],
+    discussion_summary: str,
+    agenda: str | None = None,
+    decisions: list[str] | None = None,
+    agreed_actions: list[str] | None = None,
+    next_steps: str | None = None,
+    next_checkpoint_date: str | None = None,
+) -> str:
+    issue = data_store.get_issue(issue_id)
+    if issue is None:
+        return f"Issue '{issue_id}' not found."
+
+    cp_id = issue.next_checkpoint_id()
+    checkpoint = Checkpoint(
+        id=cp_id,
+        date=date,
+        attendees=attendees,
+        agenda=agenda,
+        discussion_summary=discussion_summary,
+        decisions=decisions or [],
+        agreed_actions=agreed_actions or [],
+        next_steps=next_steps,
+        next_checkpoint_date=next_checkpoint_date,
+    )
+    issue.checkpoints.append(checkpoint)
+    issue.audit_trail.append(
+        AuditEntry(
+            action="checkpoint_logged",
+            new_value=f"{cp_id} on {date} — {len(attendees)} attendee(s)",
+        )
+    )
+    issue.updated_date = datetime.now().isoformat()
+    data_store.save_issue(issue)
+
+    lines = [
+        f"Checkpoint {cp_id} recorded for {issue_id}.",
+        f"  Date: {date}  |  Attendees: {', '.join(attendees)}",
+    ]
+    if decisions:
+        lines.append(f"  Decisions: {'; '.join(decisions)}")
+    if agreed_actions:
+        lines.append(f"  Agreed actions: {len(agreed_actions)}")
+    if next_checkpoint_date:
+        lines.append(f"  Next checkpoint: {next_checkpoint_date}")
+    lines.append(f"  Total checkpoints for {issue_id}: {len(issue.checkpoints)}")
+    return "\n".join(lines)
+
+
 def read_pdf_from_grc(file_path: str) -> str:
     """
     Read a GRC-tool PDF export and use Claude to extract structured issue data.
@@ -817,6 +1317,14 @@ def dispatch(tool_name: str, tool_input: dict) -> str:
             return read_pdf_from_grc(**tool_input)
         elif tool_name == "import_extracted_issues":
             return import_extracted_issues(**tool_input)
+        elif tool_name == "analyse_issue":
+            return analyse_issue(**tool_input)
+        elif tool_name == "get_issue_analysis":
+            return get_issue_analysis(**tool_input)
+        elif tool_name == "update_action_item":
+            return update_action_item(**tool_input)
+        elif tool_name == "log_checkpoint":
+            return log_checkpoint(**tool_input)
         else:
             return f"Unknown tool: {tool_name}"
     except Exception as exc:

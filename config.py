@@ -49,6 +49,37 @@ SLA_DAYS: dict[str, int] = {
     Severity.LOW: 180,
 }
 
+# First-line teams and the control domains they own
+FIRST_LINE_TEAMS: dict[str, list[str]] = {
+    "Infrastructure Services": [
+        ControlDomain.INFRASTRUCTURE,
+        ControlDomain.IT_OPERATIONS,
+        ControlDomain.INCIDENT_MANAGEMENT,
+    ],
+    "Application Development": [
+        ControlDomain.SOFTWARE_DEVELOPMENT,
+        ControlDomain.CHANGE_MANAGEMENT,
+    ],
+    "Service Continuity & Disaster Recovery": [
+        ControlDomain.BUSINESS_CONTINUITY,
+    ],
+    "Information Security": [
+        ControlDomain.INFORMATION_SECURITY,
+        ControlDomain.ACCESS_MANAGEMENT,
+        ControlDomain.DATA_MANAGEMENT,
+    ],
+    "Third Party Risk Management": [
+        ControlDomain.VENDOR_MANAGEMENT,
+    ],
+}
+
+# Reverse lookup: domain → primary first-line team
+DOMAIN_TO_TEAM: dict[str, str] = {
+    domain.value: team
+    for team, domains in FIRST_LINE_TEAMS.items()
+    for domain in domains
+}
+
 # Framework references per control domain
 FRAMEWORK_REFERENCES: dict[str, dict[str, str]] = {
     ControlDomain.ACCESS_MANAGEMENT: {
